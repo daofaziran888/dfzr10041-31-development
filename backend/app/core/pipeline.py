@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from app.core.alert_window import AlertForwardEngine, make_event_identity, window_start
 from app.core.models import (
     BatchCheckpoint, EventRecord, EventTypeDef, IngestJob, IngestMetric,
     LogEntry, LogFormat, LogSourceConfig, ParseResultStatus, ParseRule,
@@ -135,6 +136,23 @@ class IngestPipeline:
         self._checkpoint_store: dict[str, BatchCheckpoint] = {}
         self._event_store: dict[str, list[EventRecord]] = {}
         self._fingerprint_seen: set[str] = set()
+        # 按事件发生时间分窗的告警与转发台账，供 anomaly_rule / forward_rule 共享。
+        self.alert_engine: AlertForwardEngine | None = None
+        self._pending_alert: EventRecord | None = None
+
+    def ensure_alert_engine(self, **options: Any) -> AlertForwardEngine:
+        """惰性创建窗口告警引擎；同一管道实例跨批次共享窗口与送达台账。"""
+        if self.alert_engine is None:
+            self.alert_engine = AlertForwardEngine(**options)
+            return self.alert_engine
+        rule = {
+            "threshold": options.get("threshold"),
+            "target": options.get("target"),
+            "window_minutes": options.get("window_minutes"),
+        }
+        if any(value is not None for value in rule.values()):
+            self.alert_engine.configure(event_type_id=None, **rule)
+        return self.alert_engine
 
     # ---------- 数据流 1: log_source → parser_rule → ingest_job → event_store ----------
 
@@ -378,36 +396,131 @@ class IngestPipeline:
     # ---------- 数据流 5: event_type → anomaly_rule → forward_rule ----------
 
     def check_anomaly(self, records: list[EventRecord], event_type_id: str,
-                       threshold: int) -> list[EventRecord]:
-        """异常检测：统计指定事件类型数量，触发告警条件。
+                       threshold: int, *,
+                       window_minutes: int | None = None,
+                       target: str | None = None,
+                       received_at: datetime | None = None,
+                       now: datetime | None = None) -> list[EventRecord]:
+        """按发生时间分窗核实阈值，返回本次登记后达到门槛的窗口内的记录。
 
-        对应 anomaly_rule 模块：事件分类→异常告警路径。
+        旧行为（只按本次记录总数打标）不再作为告警依据：计数按 ``event_time``
+        落入固定时间窗，重传同一原始行只累计重传次数，不会抬高窗口计数。
+        返回值仍限定在本次传入、且属于已触发窗口的记录，方便调用方继续处理。
         """
+        engine = self.ensure_alert_engine(
+            window_minutes=window_minutes or 5,
+            threshold=threshold,
+            target=target or "default",
+        )
+        ingested = [
+            event for event in (
+                engine.ingest_record(record, received_at=received_at)
+                for record in records
+            ) if event is not None
+        ]
+        triggered_window_ids = set()
+        for window_id in {self._window_id_of(engine, event) for event in ingested}:
+            if not window_id:
+                continue
+            result = engine.evaluate_window(window_id, now=now)
+            if result and result["triggered"]:
+                triggered_window_ids.add(window_id)
+                if result["event_type"] == event_type_id:
+                    self._pending_alert = engine.find_alert(
+                        window_id=result["window_id"])
         matched = [r for r in records if r.event_type.type_id == event_type_id]
-        if len(matched) > threshold:
-            for r in matched:
-                r.parsed_fields["anomaly_alert"] = "triggered"
+        flagged = {
+            event.event_id for event in ingested
+            if self._window_id_of(engine, event) in triggered_window_ids
+        }
+        for record in matched:
+            identity = make_event_identity(
+                source_id=getattr(record, "source_host", "") or "",
+                line_number=getattr(record, "line_number", 0) or 0,
+                occurred_at=record.event_time,
+                original_line=getattr(record, "original_content", "") or "",
+            )
+            if identity in flagged:
+                record.parsed_fields["anomaly_alert"] = "triggered"
+                record.parsed_fields["anomaly_window"] = self._window_id_of(
+                    engine, engine.get_event(identity))
         return matched
 
-    def apply_forward_rules(self, records: list[EventRecord],
-                             target: str) -> list[dict[str, Any]]:
-        """编组转发规则：按目标地址组织事件批次——对应 forward_rule 模块。
+    @staticmethod
+    def _window_id_of(engine: AlertForwardEngine, event: Any) -> str | None:
+        if event is None:
+            return None
+        occurred_at = getattr(event, "occurred_at", None)
+        if occurred_at is None:
+            return None
+        rule_width = int(engine.rule_for(event.event_type_id)["window_minutes"])
+        start = window_start(occurred_at, rule_width)
+        return engine.window_id(event.event_type_id, start)
 
-        返回按目标地址分组的转发批次，供外部消费。
+    def apply_forward_rules(self, records: list[EventRecord],
+                             target: str, *,
+                             event_type_id: str | None = None,
+                             threshold: int | None = None,
+                             now: datetime | None = None,
+                             acknowledge: bool = True) -> list[dict[str, Any]]:
+        """只给实际达到门槛的窗口组转发包——对应 forward_rule 模块。
+
+        转发包由窗口告警批次（``alert_engine`` 的待派发清单）驱动，包中带触发
+        依据和原事件身份；同一窗口告警并发派发最多发一次。``records`` 只用于
+        补齐尚未进入窗口台账的记录，不再以记录条数直接编包。未显式给出阈值时
+        沿用告警规则（``check_anomaly``）已经配置的门槛。
         """
-        batches: dict[str, list[dict[str, Any]]] = {}
-        for record in records:
-            key = target or "default"
-            batches.setdefault(key, []).append({
-                "record_id": record.record_id,
-                "event_type": record.event_type.type_id,
-                "parsed_fields": record.parsed_fields,
-                "event_time": record.event_time.isoformat(),
-            })
+        engine = self.ensure_alert_engine(target=target)
+        if records:
+            engine.ingest_records(records)
+        for window_id in engine.known_window_ids():
+            engine.evaluate_window(window_id, threshold=threshold, target=target, now=now)
+        if event_type_id is not None:
+            pending_ids = {
+                alert.alert_id for alert in engine.pending_alerts(target=target)
+                if alert.event_type_id == event_type_id
+            }
+            packages = [
+                package for package in engine.dispatch(
+                    target=target, acknowledge=acknowledge, now=now,
+                    include_corrections=False)
+                if package.get("alert_id") in pending_ids
+            ]
+        else:
+            packages = engine.dispatch(
+                target=target, acknowledge=acknowledge, now=now,
+                include_corrections=False)
         return [
-            {"target": k, "count": len(v), "payload": v}
-            for k, v in batches.items()
+            {
+                "target": package.get("target"),
+                "count": package.get("count"),
+                "payload": package.get("event_identities", []),
+                "package": package,
+            }
+            for package in packages
         ]
+
+    def apply_forward_pending(self, *, target: str | None = None,
+                              now: datetime | None = None,
+                              acknowledge: bool = True) -> list[dict[str, Any]]:
+        """派发当前待派发清单（含更正包），返回实际发出的包。"""
+        engine = self.ensure_alert_engine()
+        return engine.dispatch(target=target, now=now, acknowledge=acknowledge)
+
+    def correct_event(self, event_id: str, *, new_event_type_id: str = "EVEN-0001",
+                      reason: str = "原行更正", now: datetime | None = None,
+                      auto_dispatch: bool = False) -> dict[str, Any]:
+        """原行更正：重算受影响的窗口，已送达的告警交付可关联的更正包。"""
+        engine = self.ensure_alert_engine()
+        return engine.correct_event(
+            event_id, new_event_type_id=new_event_type_id, reason=reason,
+            now=now, auto_dispatch=auto_dispatch,
+        )
+
+    def reopen_alert(self, alert_id: str, *, now: datetime | None = None) -> dict[str, Any]:
+        """重开原告警：以目标回执核清实际送达，并保留待交付的更正。"""
+        engine = self.ensure_alert_engine()
+        return engine.reopen_alert(alert_id, now=now)
 
     # ---------- 内部辅助方法 ----------
 
